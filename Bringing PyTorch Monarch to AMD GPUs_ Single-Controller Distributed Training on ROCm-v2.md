@@ -48,16 +48,21 @@ By decoupling the parallelism strategy used within each training replica from th
 
 ## Porting Monarch to ROCm: Ecosystem Integration
 
-Bringing Monarch to AMD GPUs required significant engineering effort to port the GPU runtime and distributed communication stack to ROCm. The primary technical challenge was bridging the gap between Monarch's deep integration with CUDA-specific APIs in its Rust backend and the ROCm ecosystem, particularly around asynchronous execution and memory management.
+Bringing Monarch to AMD GPUs required significant engineering effort to port the GPU runtime and distributed communication stack to ROCm.
 
-We successfully implemented three main porting paths to overcome these challenges:
+We successfully implemented three main porting paths:
 
-1. **Collective Communications**: We utilized `hipify_torch` for CUDA-to-HIP conversion, mapping NCCL calls to RCCL. This required careful handling of ROCm-specific synchronization primitives to ensure parity with NCCL's behavior in asynchronous contexts.
-2. **GPU Memory Management**: We adapted the build system to auto-detect the platform, mapping the CUDA driver API to the HIP driver API. A major hurdle here was ensuring that Tokio's asynchronous tasks correctly interacted with HIP streams without causing deadlocks or memory leaks, which required custom wrappers around HIP memory allocation functions.
-3. **RDMA Integration**: By configuring environment variables (`GPU_PLATFORM=rocm`), we mapped `libibverbs + CUDA` to `libibverbs + HIP`. We had to ensure that the memory registration for RDMA correctly recognized HIP-allocated memory, which involved patching the underlying InfiniBand verbs integration.
+1. **Collective Communications**: We used `hipify_torch` to convert the C++ bridge code from CUDA to HIP and linked against RCCL, which mirrors NCCL's API.
+2. **GPU Memory Management**: We extended the build system to auto-detect the platform and route CUDA driver API calls through their HIP equivalents.
+3. **RDMA Integration**: Configuring `GPU_PLATFORM=rocm` keeps the `libibverbs`-based RDMA path intact while swapping the GPU-side bindings from CUDA to HIP for GPU-direct transfers.
 
 ![Porting Monarch to ROCm](https://files.manuscdn.com/user_upload_by_module/session_file/310519663279446120/SpXoskYABWpMmbjP.png)
 *Figure 3: Porting Monarch from CUDA to ROCm via hipify_torch and auto-detection.*
+
+Moreover, two cross-cutting issues shaped the port and deserve a closer look:
+
+1. **No static link for the HIP runtime**: NVIDIA ships `libcudart_static.a`, so the CUDA path links `cudart_static` directly. ROCm ships no static equivalent for `libamdhip64`, so the ROCm build links `amdhip64` dynamically. Both platforms additionally `dlopen` the GPU driver API functions, including `hipMemCreate`, `cuMemCreate`, and related calls, keeping the runtime contract identical on either side.
+2. **Rust compatibility shim instead of forking the bindings**: Once `hipify_torch` rewrites the C/C++ headers, `bindgen` emits HIP-named types such as `hipError_t`, `hipDeviceptr_t`, and `hipStream_t`. Rather than add `#ifdef` branches at every Rust call site, we added a `rocm_compat` module in `nccl-sys` and `rdmaxcel-sys` that re-exports HIP symbols under their CUDA names, for example `pub type cudaError_t = hipError_t` and `pub use hipSetDevice as cudaSetDevice`. The rest of the Rust code stays platform-agnostic.
 
 These efforts culminated in the introduction of HIP type aliases in Rust, with all 1,171 tests passing, ensuring full support for ROCm 7.0+. We have upstreamed these contributions to the open-source community (see PR [#2393](https://github.com/meta-pytorch/monarch/pull/2393) and PR [#2891](https://github.com/meta-pytorch/monarch/pull/2891)).
 
